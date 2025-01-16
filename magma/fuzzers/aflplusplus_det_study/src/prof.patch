@@ -1,0 +1,257 @@
+diff --git a/include/afl-fuzz.h b/include/afl-fuzz.h
+index f1813df6..0c142e24 100644
+--- a/include/afl-fuzz.h
++++ b/include/afl-fuzz.h
+@@ -149,6 +149,21 @@ struct tainted {
+ 
+ };
+ 
++struct havoc_profile {
++
++  u32 queued_det_stage,                 /* Det/Havoc Stage Profiling        */
++      queued_havoc_stage,
++      total_queued_det,
++      edge_det_stage,
++      edge_havoc_stage,
++      total_det_edge;
++  
++  u64 det_stage_time,
++      havoc_stage_time, 
++      total_det_time;
++
++};
++
+ struct queue_entry {
+ 
+   u8 *fname;                            /* File name for the test case      */
+@@ -188,6 +203,8 @@ struct queue_entry {
+ 
+   u8 *trace_mini;                       /* Trace bytes, if kept             */
+   u32 tc_ref;                           /* Trace bytes ref count            */
++  u32 eff_cnt,
++      undet_bits; 
+ 
+ #ifdef INTROSPECTION
+   u32 bitsmap_size;
+@@ -544,7 +561,8 @@ typedef struct afl_state {
+ 
+   u8 *virgin_bits,                      /* Regions yet untouched by fuzzing */
+       *virgin_tmout,                    /* Bits we haven't seen in tmouts   */
+-      *virgin_crash;                    /* Bits we haven't seen in crashes  */
++      *virgin_crash,                    /* Bits we haven't seen in crashes  */
++      *virgin_det_bits;
+ 
+   double *alias_probability;            /* alias weighted probabilities     */
+   u32    *alias_table;                /* alias weighted random lookup table */
+@@ -782,6 +800,9 @@ typedef struct afl_state {
+    * is too large) */
+   struct queue_entry **q_testcase_cache;
+ 
++  /* Global Profile Data for deterministic/havoc-splice stage */
++  struct havoc_profile *havoc_prof;
++
+ #ifdef INTROSPECTION
+   char  mutation[8072];
+   char  m_tmp[4096];
+@@ -1154,6 +1175,7 @@ void load_stats_file(afl_state_t *);
+ void write_setup_file(afl_state_t *, u32, char **);
+ void write_stats_file(afl_state_t *, u32, double, double, double);
+ void maybe_update_plot_file(afl_state_t *, u32, double, double);
++void update_profile_file(afl_state_t *, struct queue_entry *);
+ void write_queue_stats(afl_state_t *);
+ void show_stats(afl_state_t *);
+ void show_stats_normal(afl_state_t *);
+diff --git a/include/forkserver.h b/include/forkserver.h
+index f6230fe8..ee49bcb7 100644
+--- a/include/forkserver.h
++++ b/include/forkserver.h
+@@ -126,7 +126,8 @@ typedef struct afl_forkserver {
+   u8 *out_file,                         /* File to fuzz, if any             */
+       *target_path;                     /* Path of the target               */
+ 
+-  FILE *plot_file;                      /* Gnuplot output file              */
++  FILE *plot_file,                      /* Gnuplot output file              */
++       *prof_plot_file;
+ 
+   /* Note: last_run_timed_out is u32 to send it to the child as 4 byte array */
+   u32 last_run_timed_out;               /* Traced process timed out?        */
+diff --git a/src/afl-fuzz-init.c b/src/afl-fuzz-init.c
+index 8ab44a3b..b9265b88 100644
+--- a/src/afl-fuzz-init.c
++++ b/src/afl-fuzz-init.c
+@@ -2007,6 +2007,10 @@ static void handle_existing_out_dir(afl_state_t *afl) {
+     if (unlink(fn) && errno != ENOENT) { goto dir_cleanup_failed; }
+     ck_free(fn);
+ 
++    fn = alloc_printf("%s/det_prof_data", afl->out_dir);
++    if (unlink(fn) && errno != ENOENT) { goto dir_cleanup_failed; }
++    ck_free(fn);
++
+   }
+ 
+   fn = alloc_printf("%s/queue_data", afl->out_dir);
+@@ -2236,6 +2240,17 @@ void setup_dirs_fds(afl_state_t *afl) {
+ 
+   fflush(afl->fsrv.plot_file);
+ 
++  tmp = alloc_printf("%s/det_prof_data", afl->out_dir);
++
++  int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, DEFAULT_PERMISSION);
++  if (fd < 0) { PFATAL("Unable to create '%s'", tmp); }
++  ck_free(tmp);
++
++  afl->fsrv.prof_plot_file = fdopen(fd, "w");
++  if (!afl->fsrv.prof_plot_file) { PFATAL("fdopen() failed"); }
++
++  fflush(afl->fsrv.prof_plot_file);
++
+   /* ignore errors */
+ 
+ }
+diff --git a/src/afl-fuzz-one.c b/src/afl-fuzz-one.c
+index 01e34b69..06ae8a42 100644
+--- a/src/afl-fuzz-one.c
++++ b/src/afl-fuzz-one.c
+@@ -545,6 +545,13 @@ u8 fuzz_one_original(afl_state_t *afl) {
+ 
+   }
+ 
++  u64 before_det_time = get_cur_time(), 
++      before_havoc_time;
++  u32 before_det_findings = afl->queued_items,
++      before_det_edges = count_non_255_bytes(afl, afl->virgin_bits),
++      before_havoc_findings, before_havoc_edges;
++  u8 is_logged = 0;
++
+   /* Skip right away if -d is given, if it has not been chosen sufficiently
+      often to warrant the expensive deterministic stage (fuzz_level), or
+      if it has gone through deterministic testing in earlier, resumed runs
+@@ -603,6 +610,19 @@ u8 fuzz_one_original(afl_state_t *afl) {
+   prev_cksum = hash64(afl->fsrv.trace_bits, afl->fsrv.map_size, HASH_CONST);
+   _prev_cksum = prev_cksum;
+ 
++  /* calc eff bytes */
++  if (!afl->virgin_det_bits) afl->virgin_det_bits = ck_alloc(afl->fsrv.map_size);
++  for (i = 0; i < afl->fsrv.map_size; i ++) {
++
++    if (afl->fsrv.trace_bits[i] && !afl->virgin_det_bits[i]) {
++      
++      afl->virgin_det_bits[i] = 1;
++      afl->queue_cur->undet_bits += 1;
++
++    }
++  
++  }
++
+   /* Now flip bits. */
+ 
+   for (afl->stage_cur = 0; afl->stage_cur < afl->stage_max; ++afl->stage_cur) {
+@@ -882,10 +902,13 @@ u8 fuzz_one_original(afl_state_t *afl) {
+     memset(eff_map, 1, EFF_ALEN(len));
+ 
+     afl->blocks_eff_select += EFF_ALEN(len);
++    afl->queue_cur->eff_cnt = len;
++
+ 
+   } else {
+ 
+     afl->blocks_eff_select += eff_cnt;
++    afl->queue_cur->eff_cnt = eff_cnt * 8;
+ 
+   }
+ 
+@@ -2020,6 +2043,15 @@ custom_mutator_stage:
+ 
+ havoc_stage:
+ 
++  if (!is_logged) {
++    
++    is_logged = 1;
++    before_havoc_findings = afl->queued_items;
++    before_havoc_edges = count_non_255_bytes(afl, afl->virgin_bits);
++    before_havoc_time = get_cur_time();
++
++  }
++
+   if (unlikely(afl->custom_only)) {
+ 
+     /* Force UI update */
+@@ -3430,6 +3462,18 @@ retry_splicing:
+ 
+   ret_val = 0;
+ 
++  afl->havoc_prof->queued_det_stage = before_havoc_findings - before_det_findings;
++  afl->havoc_prof->queued_havoc_stage = afl->queued_items - before_havoc_findings;
++  afl->havoc_prof->total_queued_det += afl->havoc_prof->queued_det_stage;
++  afl->havoc_prof->edge_det_stage = before_havoc_edges - before_det_edges;
++  afl->havoc_prof->edge_havoc_stage = count_non_255_bytes(afl, afl->virgin_bits) - before_havoc_edges;
++  afl->havoc_prof->total_det_edge += afl->havoc_prof->edge_det_stage;
++  afl->havoc_prof->det_stage_time = before_havoc_time - before_det_time;
++  afl->havoc_prof->havoc_stage_time = get_cur_time() - before_havoc_time;
++  afl->havoc_prof->total_det_time += afl->havoc_prof->det_stage_time;
++
++  update_profile_file(afl, afl->queue_cur);
++
+ /* we are through with this queue entry - for this iteration */
+ abandon_entry:
+ 
+diff --git a/src/afl-fuzz-state.c b/src/afl-fuzz-state.c
+index 7d6fdfb9..c4494def 100644
+--- a/src/afl-fuzz-state.c
++++ b/src/afl-fuzz-state.c
+@@ -140,6 +140,8 @@ void afl_state_init(afl_state_t *afl, uint32_t map_size) {
+   afl->fsrv.child_pid = -1;
+   afl->fsrv.out_dir_fd = -1;
+ 
++  afl->havoc_prof = (struct havoc_profile *)ck_alloc(sizeof(struct havoc_profile));
++
+   init_mopt_globals(afl);
+ 
+   list_append(&afl_states, afl);
+diff --git a/src/afl-fuzz-stats.c b/src/afl-fuzz-stats.c
+index deb28b7a..93197dd9 100644
+--- a/src/afl-fuzz-stats.c
++++ b/src/afl-fuzz-stats.c
+@@ -450,6 +450,30 @@ void write_queue_stats(afl_state_t *afl) {
+ 
+ #endif
+ 
++void update_profile_file(afl_state_t *afl, struct queue_entry *q) {
++
++  u32 current_edges = count_non_255_bytes(afl, afl->virgin_bits);
++
++  double det_finding_rate = (double)afl->havoc_prof->total_det_edge * 100.0 / (double)current_edges,
++         det_time_rate = (double)afl->havoc_prof->total_det_time * 100.0 / (double)(get_cur_time() - afl->start_time),
++         eff_map_rate = (double)q->eff_cnt * 100.0 / (double)(q->len);
++
++  /*
++    [%02lld:%02lld:%02lld] fuzz %d (%d), find %d/%d among %d(%02.2f) and spend %lld/%lld(%02.2f), cover %02.2f yet, %d/%d undet bits, continue %d.\n
++  */
++
++  fprintf(afl->fsrv.prof_plot_file,
++          "%llu, %u (%u), %u, %u/%u (%0.02f%%) ,%u/%u/%u (%0.02f%%), "
++          "%llu/%llu (%0.02f%%)\n",
++          ((afl->prev_run_time + get_cur_time() - afl->start_time) / 1000),
++          q->id, q->fuzz_level, q->undet_bits, q->eff_cnt, q->len, eff_map_rate,
++          afl->havoc_prof->edge_det_stage, afl->havoc_prof->edge_havoc_stage, current_edges, det_finding_rate,
++          afl->havoc_prof->det_stage_time / 1000, afl->havoc_prof->havoc_stage_time / 1000, det_time_rate);                     /* ignore errors */
++
++  fflush(afl->fsrv.prof_plot_file);
++  
++}
++
+ /* Update the plot file if there is a reason to. */
+ 
+ void maybe_update_plot_file(afl_state_t *afl, u32 t_bytes, double bitmap_cvg,
+diff --git a/src/afl-fuzz.c b/src/afl-fuzz.c
+index 8cf6c735..df1c2213 100644
+--- a/src/afl-fuzz.c
++++ b/src/afl-fuzz.c
+@@ -3031,6 +3031,7 @@ stop_fuzzing:
+   if (frida_afl_preload) { ck_free(frida_afl_preload); }
+ 
+   fclose(afl->fsrv.plot_file);
++  fclose(afl->fsrv.prof_plot_file);
+   destroy_queue(afl);
+   destroy_extras(afl);
+   destroy_custom_mutators(afl);
