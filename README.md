@@ -40,6 +40,15 @@ As this evaluation is running on the Google cluster and comparing against the
 best configuration, we don't provide a local reproduce. You can use the 
 AFL++'s FuzzBench configuration for MendelFuzz to replicate the results.
 
+**Note**: In the public report, MendelFuzz don't have data for 
+`proj4_proj_crs_to_crs_fuzzer`, which makes its `avg. score` looks worse. 
+However, in that campaign all fuzzers failed to run the `proj4_proj_crs_to_crs_fuzzer` 
+due to an Google cluster internal error. And all the fuzzer data of 
+`proj4` are cached from another campaign (`2023-12-10-standard-cov`, which 
+does not contain mendelfuzz so there are no cached data for mendelfuzz), 
+that's why we exclude this program in the generated report and our paper. 
+
+
 ### Reproduce the MAGMA
 
 Simply step to `magma/tools/captain` and run `./run.sh`
